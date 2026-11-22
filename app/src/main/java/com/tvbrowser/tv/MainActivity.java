@@ -33,6 +33,7 @@ import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.text.InputType;
+import android.util.Log;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
 import android.webkit.JsResult;
@@ -60,6 +61,10 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -85,6 +90,7 @@ public class MainActivity extends Activity {
 
     private final AppUpdater updater = new AppUpdater(this);
     private WebView webView;
+    private String dpadNavigationScript;
     private EditText addressBar;
     private LinearLayout toolbar;
     private View[] toolbarControls;
@@ -283,6 +289,7 @@ public class MainActivity extends Activity {
         browserFrame.addView(cursorIndicator, cursorParams);
 
         configureWebView();
+        webView.setOnFocusChangeListener((view, focused) -> updatePageDpadMode());
         TVBrowserApp.markPhase(this, "webview_configured");
 
         back.setOnClickListener(v -> browserBack());
@@ -447,7 +454,8 @@ public class MainActivity extends Activity {
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onUnhandledKeyEvent(WebView view, KeyEvent event) {
-                if (!finishWebVerticalNavigation(event)) super.onUnhandledKeyEvent(view, event);
+                if (returnToToolbarOnUnhandledUp(event)) return;
+                if (!isArrowKey(event.getKeyCode())) super.onUnhandledKeyEvent(view, event);
             }
 
             @Override
@@ -492,6 +500,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageCommitVisible(WebView view, String url) {
                 installPageMenuTracking(view);
+                installPageDpadNavigation();
                 injectTvPageOptimisation();
                 injectCosmeticAdCleanup();
             }
@@ -499,6 +508,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 installPageMenuTracking(view);
+                installPageDpadNavigation();
                 if (url != null && !url.isEmpty()) currentPageUrl = url;
                 if (!addressEditing) addressBar.setText(url);
                 recordHistory(url, view.getTitle());
@@ -1333,6 +1343,7 @@ public class MainActivity extends Activity {
 
     private void toggleCursorMode() {
         cursorMode = !cursorMode;
+        updatePageDpadMode();
         cancelPendingOk();
         if (cursorMode) {
             initialiseCursorIfNeeded();
@@ -1495,20 +1506,41 @@ public class MainActivity extends Activity {
         return false;
     }
 
-    private boolean finishWebVerticalNavigation(KeyEvent event) {
-        if (cursorMode || webView == null || getCurrentFocus() != webView) return false;
-        int key = event.getKeyCode();
-        if (key != KeyEvent.KEYCODE_DPAD_UP && key != KeyEvent.KEYCODE_DPAD_DOWN) return false;
-        if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
-
-        if (key == KeyEvent.KEYCODE_DPAD_DOWN) {
-            webView.pageDown(false);
-        } else if (!webView.pageUp(false)) {
-            if (lastToolbarFocus == null || !lastToolbarFocus.requestFocus(View.FOCUS_UP)) {
-                addressBar.requestFocus(View.FOCUS_UP);
+    private void installPageDpadNavigation() {
+        if (dpadNavigationScript == null) {
+            try (InputStream input = getAssets().open("dpad-navigation.js");
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[4096];
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, count);
+                }
+                dpadNavigationScript = new String(output.toByteArray(), StandardCharsets.UTF_8);
+            } catch (IOException error) {
+                Log.w("TVBrowser", "Unable to load D-pad navigation", error);
+                return;
             }
         }
-        return true;
+        webView.evaluateJavascript(dpadNavigationScript + pageDpadModeScript(), null);
+    }
+
+    private String pageDpadModeScript() {
+        boolean enabled = !cursorMode && webView.hasFocus() && customView == null;
+        return "\nwindow.__tvbrowserDpad?.(" + enabled + ");";
+    }
+
+    private void updatePageDpadMode() {
+        webView.evaluateJavascript(pageDpadModeScript(), null);
+    }
+
+    private boolean returnToToolbarOnUnhandledUp(KeyEvent event) {
+        if (cursorMode || customView != null || getCurrentFocus() != webView
+                || event.getKeyCode() != KeyEvent.KEYCODE_DPAD_UP
+                || event.getAction() != KeyEvent.ACTION_DOWN
+                || webView.canScrollVertically(-1)) return false;
+
+        if (lastToolbarFocus != null && lastToolbarFocus.requestFocus(View.FOCUS_UP)) return true;
+        return addressBar.requestFocus(View.FOCUS_UP);
     }
 
     @Override
@@ -1525,8 +1557,9 @@ public class MainActivity extends Activity {
         }
 
         if (webView != null && getCurrentFocus() == webView
-                && (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN)) {
-            return webView.dispatchKeyEvent(event) || finishWebVerticalNavigation(event);
+                && isArrowKey(keyCode)) {
+            if (!webView.dispatchKeyEvent(event)) returnToToolbarOnUnhandledUp(event);
+            return true;
         }
 
         if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_MENU) {
